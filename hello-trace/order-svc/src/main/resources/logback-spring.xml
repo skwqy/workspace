@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  order-svc 的 logback 配置：演示两个"内置"TurboFilter。
+  （自定义 TurboFilter 的写法见 stock-svc 的 RateLimitTurboFilter）
+-->
+<configuration>
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="unknown"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [${APP_NAME} %X{traceId:-}/%X{spanId:-}] [%thread] %logger{36} %marker - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- TurboFilter 1：敏感数据 marker 全局丢弃（与 stock-svc 保持同一条安全底线） -->
+    <turboFilter class="ch.qos.logback.classic.turbo.MarkerFilter">
+        <Marker>CONFIDENTIAL</Marker>
+        <OnMatch>DENY</OnMatch>
+    </turboFilter>
+
+    <!-- TurboFilter 2：重复消息抑制。
+         语义是"按消息格式计数、超过 allowedRepetitions 永久 DENY"——
+         同一个格式（参数不同也算同格式）在第 6 次起再也看不到。
+         这是最粗暴的省日志手段：长时间运行的服务慎用，
+         所以 stock-svc 用的是带时间窗口的自定义 RateLimitTurboFilter -->
+    <turboFilter class="ch.qos.logback.classic.turbo.DuplicateMessageFilter">
+        <allowedRepetitions>5</allowedRepetitions>
+        <cacheSize>1000</cacheSize>
+    </turboFilter>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

@@ -1,0 +1,21 @@
+spring:
+  application:
+    name: order-svc
+  threads:
+    virtual:
+      enabled: true
+
+stock:
+  base-url: http://localhost:8082
+
+server:
+  port: 8081
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  tracing:
+    sampling:
+      probability: 1.0

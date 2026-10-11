@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.1</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>hello-trace</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>hello-trace</name>
+    <description>双进程调用链样例：Spring Boot 4.1.1 + JDK 25 虚拟线程 + Micrometer Tracing + Logback Marker/TurboFilter</description>
+
+    <modules>
+        <module>trace-common</module>
+        <module>stock-svc</module>
+        <module>order-svc</module>
+    </modules>
+
+    <properties>
+        <java.version>25</java.version>
+    </properties>
+</project>

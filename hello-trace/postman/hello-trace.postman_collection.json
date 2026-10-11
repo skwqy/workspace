@@ -1,0 +1,61 @@
+{
+  "info": {
+    "name": "hello-trace（双进程调用链：虚拟线程 + Tracing + Marker/TurboFilter）",
+    "description": "order-svc(8081) 调用 stock-svc(8082)。先启动两个服务再运行本集合。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "order", "value": "http://localhost:8081" },
+    { "key": "stock", "value": "http://localhost:8082" }
+  ],
+  "item": [
+    {
+      "name": "0. health × 2",
+      "request": { "method": "GET", "url": "{{order}}/actuator/health" }
+    },
+    {
+      "name": "1. 下单（order 并行调用 stock 两个接口，看 traceId/virtual）",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"sku\":\"A-100\",\"qty\":2}" },
+        "url": "{{order}}/orders"
+      }
+    },
+    {
+      "name": "2. 并发扇出 burst（n=30 个虚拟线程打 stock，看两侧 TurboFilter）",
+      "request": {
+        "method": "GET",
+        "url": "{{order}}/orders/burst?n=30&delayMs=60"
+      }
+    },
+    {
+      "name": "3. 库存查询（直接打 stock）",
+      "request": {
+        "method": "GET",
+        "url": "{{stock}}/stock/A-100?delayMs=80"
+      }
+    },
+    {
+      "name": "4. 库存查询失败（fail=true，ERROR 不受限流影响）",
+      "request": {
+        "method": "GET",
+        "url": "{{stock}}/stock/FAIL-9?fail=true&delayMs=10"
+      }
+    },
+    {
+      "name": "5. 审计（CONFIDENTIAL 被 TurboFilter 丢弃，SECURITY 进独立文件）",
+      "request": {
+        "method": "GET",
+        "url": "{{stock}}/stock/audit?sku=A-100&phone=13800001111"
+      }
+    },
+    {
+      "name": "6. 审计 debug=true（DynamicThresholdFilter 按请求放开 DEBUG）",
+      "request": {
+        "method": "GET",
+        "url": "{{stock}}/stock/audit?sku=A-100&phone=13800001111&debug=true"
+      }
+    }
+  ]
+}

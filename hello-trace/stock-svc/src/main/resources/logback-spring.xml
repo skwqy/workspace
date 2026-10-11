@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  stock-svc 的 logback 配置：演示 TurboFilter 三种内置/自定义用法 + Marker 路由。
+
+  TurboFilter 按声明顺序评估，第一个给出明确结论（ACCEPT/DENY）的生效：
+  1. MarkerFilter      —— CONFIDENTIAL（敏感数据）无条件 DENY
+  2. DynamicThresholdFilter —— MDC debugOn=true 的请求放开到 TRACE，其余维持 INFO 门禁
+  3. RateLimitTurboFilter   —— 自定义：每个 logger 每秒最多 10 条 INFO/DEBUG
+-->
+<configuration>
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="unknown"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <!-- %marker 会把命中的 Marker 以 {SECURITY} 形式打出来，演示直观 -->
+            <pattern>%d{HH:mm:ss.SSS} %-5level [${APP_NAME} %X{traceId:-}/%X{spanId:-}] [%thread] %logger{36} %marker - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- SECURITY Marker 单独落盘：只收带 SECURITY 标记的事件 -->
+    <appender name="SECURITY_FILE" class="ch.qos.logback.core.FileAppender">
+        <file>logs/stock-svc/security-audit.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger - %msg%n</pattern>
+        </encoder>
+        <filter class="ch.qos.logback.core.filter.EvaluatorFilter">
+            <evaluator class="ch.qos.logback.classic.boolex.OnMarkerEvaluator">
+                <marker>SECURITY</marker>
+            </evaluator>
+            <onMatch>ACCEPT</onMatch>
+            <onMismatch>DENY</onMismatch>
+        </filter>
+    </appender>
+
+    <!-- TurboFilter 1：敏感数据 marker 全局丢弃。代码写错也不漏 -->
+    <turboFilter class="ch.qos.logback.classic.turbo.MarkerFilter">
+        <Marker>CONFIDENTIAL</Marker>
+        <OnMatch>DENY</OnMatch>
+    </turboFilter>
+
+    <!-- TurboFilter 2：按 MDC 动态调级。默认 INFO 门禁（DEBUG 在这里就被 DENY），
+         MDC 里 debugOn=true 的请求（/stock/audit?debug=true）放开到 TRACE -->
+    <turboFilter class="ch.qos.logback.classic.turbo.DynamicThresholdFilter">
+        <Key>debugOn</Key>
+        <DefaultThreshold>INFO</DefaultThreshold>
+        <!-- logback 1.5 的 MDCValueLevelPair 只有 value/level，MDC key 由上面 <Key> 统一指定 -->
+        <MDCValueLevelPair>
+            <value>true</value>
+            <level>TRACE</level>
+        </MDCValueLevelPair>
+        <OnHigherOrEqual>NEUTRAL</OnHigherOrEqual>
+        <OnLower>DENY</OnLower>
+    </turboFilter>
+
+    <!-- TurboFilter 3：自定义限流，见 com.example.stock.logging.RateLimitTurboFilter -->
+    <turboFilter class="com.example.stock.logging.RateLimitTurboFilter">
+        <maxPerSecond>10</maxPerSecond>
+    </turboFilter>
+
+    <!-- root 开到 DEBUG：普通请求的 DEBUG 会被上面的 DynamicThresholdFilter
+         在 turbo 层直接 DENY（DefaultThreshold=INFO + OnLower=DENY），
+         只有 ?debug=true 的请求真正输出 DEBUG。
+         这是 DynamicThresholdFilter 的标准姿势：门禁在 turbo 层，而非 root 级别 -->
+    <root level="DEBUG">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="SECURITY_FILE"/>
+    </root>
+</configuration>
