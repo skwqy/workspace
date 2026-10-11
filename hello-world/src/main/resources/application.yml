@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: hello-world
+  lifecycle:
+    timeout-per-shutdown-phase: 10s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

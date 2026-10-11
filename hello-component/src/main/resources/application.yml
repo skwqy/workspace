@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: hello-component
+  lifecycle:
+    timeout-per-shutdown-phase: 10s
+
+  # MySQL（study 库；地址做成环境变量，IDEA 直跑默认 localhost，容器里注入 host.docker.internal）
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:3306/study?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf8
+    username: ${DB_USER:root}
+    password: ${DB_PASSWORD:7c0e0059c35a9391232befb0}
+  jpa:
+    hibernate:
+      ddl-auto: update        # 自动建表/补列（hello_message），学习环境够用
+    open-in-view: false
+
+  # Redis
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: 6379
+      password: ${REDIS_PASSWORD:ffb4c9be878cde5c0af6b7b3}
+
+  # Kafka（bootstrap 后按端口匹配 listener；容器里用 29092 才会选中 DOCKER 这条可达路径）
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer:
+      group-id: hello-component
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

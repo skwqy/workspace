@@ -1,0 +1,207 @@
+{
+	"info": {
+		"_postman_id": "7f3c2a1e-5b8d-4e6f-9a0c-1d2e3f4a5b6c",
+		"name": "hello-component（Spring Boot 4.1.1 + MySQL/Redis/Kafka）",
+		"description": "验证 hello-component 全链路：MySQL 落库 → Kafka 收发 → Redis 读写。\n\n【前置】study-stack 三服务全部 (healthy) + 应用容器已启动（127.0.0.1:8081）。\n【用法】按文件夹顺序执行；点完「① MySQL 保存并发 Kafka」等 2~3 秒再点「③ Kafka 消费回读」。\n【变量】baseUrl 在集合变量里，应用换端口时改这一处即可。",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "0. 健康检查",
+			"item": [
+				{
+					"name": "actuator/health（三组件聚合状态）",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/actuator/health",
+							"host": ["{{baseUrl}}"],
+							"path": ["actuator", "health"]
+						},
+						"description": "status=UP 表示 db / redis / kafka 全部连通；任何一个组件 DOWN 都会反映在这里。"
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+									"pm.test('整体状态 UP', () => pm.expect(pm.response.json().status).to.eql('UP'));"
+								]
+							}
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "1. MySQL + Kafka 链路",
+			"item": [
+				{
+					"name": "① MySQL 保存并发 Kafka",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/messages?content=你好,Postman!",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "messages"],
+							"query": [
+								{
+									"key": "content",
+									"value": "你好,Postman!",
+									"description": "消息内容；Postman 会正确按 UTF-8 编码（此前 curl 400 是 Git Bash 控制台 GBK 的锅，服务端没问题）"
+								}
+							]
+						},
+						"description": "保存到 MySQL study.hello_message（JPA 自动建表），并发送到 Kafka topic hello-topic。返回带自增 id 的 JSON。"
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+									"pm.test('返回自增 id', () => pm.expect(pm.response.json()).to.have.property('id'));"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "② MySQL 查询全部",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/messages",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "messages"]
+						},
+						"description": "查 hello_message 全部记录，新→旧排列。"
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+									"pm.test('返回数组', () => pm.expect(Array.isArray(pm.response.json())).to.be.true);"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "③ Kafka 消费回读（先等 2~3 秒再点）",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/kafka/last",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "kafka", "last"]
+						},
+						"description": "消费者收到消息后写进 Redis key kafka:last（TTL 1 天），本接口回读。返回「N:内容」即证明 生产 → 消费 → 落 Redis 全链路通了。"
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+									"pm.test('已消费到消息（非空占位文案）', () => pm.expect(pm.response.text()).to.not.include('还没消费到任何消息'));"
+								]
+							}
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "2. Redis",
+			"item": [
+				{
+					"name": "④ Redis 写（TTL 10 分钟）",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/redis/demo?value=hello-redis",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "redis", "demo"],
+							"query": [
+								{
+									"key": "value",
+									"value": "hello-redis"
+								}
+							],
+							"variable": [
+								{
+									"key": "key",
+									"value": "demo"
+								}
+							]
+						},
+						"description": "写 Redis key（路径变量 {key}，可在 Params 页改）。10 分钟后自动过期。"
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+									"pm.test('写入成功', () => pm.expect(pm.response.text()).to.include('OK'));"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "⑤ Redis 读",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/redis/demo",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "redis", "demo"],
+							"variable": [
+								{
+									"key": "key",
+									"value": "demo"
+								}
+							]
+						},
+						"description": "读取刚写的 key；10 分钟后再读会返回「(null：不存在或已过期)」，可用来观察 TTL。"
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+									"pm.test('读到写入的值', () => pm.expect(pm.response.text()).to.eql('hello-redis'));"
+								]
+							}
+						}
+					]
+				}
+			]
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8081",
+			"description": "hello-component 应用地址；改端口只需改这里"
+		}
+	]
+}

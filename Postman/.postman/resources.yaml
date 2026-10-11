@@ -1,0 +1,13 @@
+# Use this workspace to collaborate
+workspace:
+  id: 8e167e02-ad20-4261-8b08-943e203fbf4c
+
+cloudResources:
+  collections:
+    ../postman/collections/hello-component（Spring Boot 4.1.1 + MySQL-Redis-Kafka）: fc613eef-f2c9-49ff-a9a8-16f166fb06f9
+
+# All resources in the `postman/` folder are automatically registered in Local View.
+# Point to additional files outside the `postman/` folder to register them individually. Example:
+#localResources:
+#  collections:
+#    - ../tests/E2E Test Collection/

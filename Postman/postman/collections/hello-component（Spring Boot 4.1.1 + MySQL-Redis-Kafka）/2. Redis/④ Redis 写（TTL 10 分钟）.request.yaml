@@ -1,0 +1,15 @@
+$kind: http-request
+description: 写 Redis key（路径变量 {key}，可在 Params 页改）。10 分钟后自动过期。
+url: "{{baseUrl}}/api/redis/demo?value=hello-redis"
+method: POST
+queryParams:
+  value: hello-redis
+pathVariables:
+  key: demo
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('HTTP 200', () => pm.response.to.have.status(200));
+      pm.test('写入成功', () => pm.expect(pm.response.text()).to.include('OK'));
+    language: text/javascript
+order: 1000

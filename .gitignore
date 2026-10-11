@@ -1,0 +1,14 @@
+# Java / Maven 构建产物
+target/
+*.class
+
+# IDE（IntelliJ IDEA）
+.idea/
+*.iml
+
+# Docker 环境变量（含真实密码，模板 .env.example 正常提交）
+.env
+
+# 操作系统
+Thumbs.db
+.DS_Store
