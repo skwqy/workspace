@@ -4,10 +4,29 @@
 STACKS_DIR=/d/code/workspace/docker-stacks
 
 echo "== 1/3 启动 Docker Desktop =="
+# Docker Desktop 有两种安装位置：系统级（Program Files）/ 用户级（AppData\Local\Programs），逐个探测
+find_docker_desktop() {
+  local candidates=(
+    "/c/Program Files/Docker/Docker/Docker Desktop.exe"
+    "$LOCALAPPDATA/Programs/DockerDesktop/Docker Desktop.exe"
+    "/c/Users/$USERNAME/AppData/Local/Programs/DockerDesktop/Docker Desktop.exe"
+  )
+  for c in "${candidates[@]}"; do
+    [ -f "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
 if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   echo "引擎已在运行"
 else
-  powershell.exe -NoProfile -Command 'Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"'
+  DD_EXE=$(find_docker_desktop) || {
+    echo "[!!] 找不到 Docker Desktop.exe，请确认已安装 Docker Desktop"
+    exit 1
+  }
+  echo "   -> $DD_EXE"
+  DD_WIN=$(cygpath -w "$DD_EXE" 2>/dev/null || echo "$DD_EXE")
+  powershell.exe -NoProfile -Command "Start-Process -FilePath '$DD_WIN'"
   printf "等待引擎就绪"
   up=0
   for i in $(seq 1 36); do
