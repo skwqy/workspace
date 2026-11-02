@@ -23,6 +23,7 @@
 | 照着做，一条命令跑起来 | [七、启动与验证](#七启动与验证) |
 | 已经踩过的坑 | [八、坑与排障](#八坑与排障实测) |
 | 上生产还差什么 | [九、生产化差距清单](#九生产化差距清单) |
+| **这套体系哪里会坏，重来一次我会怎么设计** | [十、体系评审](#十体系评审缺陷清单与重构设计) |
 
 **约定**：本文所有"实测"字样，都是在 `D:\code\workspace\hello-observability` 里真实跑出来的输出，不是示意。
 
@@ -207,6 +208,7 @@ flowchart LR
     F --> G[七、启动与验证]
     G --> H[八、坑与排障]
     H --> I[九、生产化差距]
+    I --> J[十、体系评审<br/>缺陷与重构设计]
 ```
 
 ---
@@ -1258,6 +1260,395 @@ docker compose --profile app up -d --build
 | P2 | agent 升级策略 | 手工 → 镜像构建期固定版本 + 灰度发布 |
 | P2 | Grafana | 无（用 Prometheus 自带 UI）→ 导入 JVM/HTTP/业务三个看板 |
 | P3 | 日志归档 | 无 → Kafka 再加一个消费者，落对象存储（S3/MinIO）做冷备 |
+
+> 这一章是"还差什么"的清单。**为什么会长成这样、如果重来一次怎么设计**，见 [十、体系评审](#十体系评审缺陷清单与重构设计)。
+
+---
+
+## 十、体系评审：缺陷清单与重构设计
+
+> 前九章回答"它怎么工作"，这一章回答两个更难的问题：**它哪里会坏**，以及**如果从零开始，我会怎么设计**。
+> 每条判断都尽量落到可核对的位置（配置项、代码行、实测输出）；凡属推断而非实测的，明确标注"推断"。
+> 评审对象是当前仓库的代码，不是"理想中的别家架构"——所以有些缺陷是"教学简化"的必然产物，也会写清楚这一点。
+
+### 10.1 结论先行：3 个结构性问题
+
+先给评价，再展开。
+
+| 维度 | 评分 | 依据 |
+|---|---|---|
+| 覆盖度 | 8 / 10 | 三支柱齐全、关联可用（exemplar + trace_id）；缺容器指标、缺下游依赖指标、缺告警与看板 |
+| 正确性 | 6 / 10 | `@Timed` 曾整族失效（已修）；`@Timed(percentiles)` 实测无效；`order.query` 没有 span；同一概念两个属性名 |
+| 成本效率 | 5 / 10 | 524 条序列只服务 5 个接口；HTTP 直方图 58 桶/组合；日志双通道 + 4 跳管道 |
+| 可运维性 | 5 / 10 | collector 自身不可观测；Jaeger 内存存储；ES 无 ILM；零告警规则 |
+| 可验证性 | 4 / 10 | 观测行为没有任何测试；配置注释被当成事实（exemplar 那条从未被验证过） |
+
+**S1｜两套埋点源，靠人工保持一致。**
+
+指标走 Micrometer（`@Observed`/`@Timed`/手写 Meter），链路走 OTel（agent + `@WithSpan`/手写 Tracer）。
+同一段逻辑写两遍注解，两者之间没有任何编译期或运行期约束。实测后果非常直接：
+
+- `order.query` 只有 `@Timed`，**Jaeger 里没有对应 span** —— 查单慢了，链路里看不到慢在哪个方法；
+- `@Timed(percentiles=…)` 在 Micrometer 1.13+ 上被**静默忽略**（同一指标族里 histogram 与 quantile 不能共存，Micrometer 优先 histogram），配了等于没配；
+- `@Timed`/`@Counted` 的切面曾被 `management.observations.annotations.enabled=false` 连带关掉，**整族指标消失且没有任何报错**（§8.2 记录的那次）。
+
+这不是"某个参数配错了"，而是"两套机制各自演进、靠人对齐"的必然产物。注解越多，漏掉的概率越接近 1。
+
+**S2｜可观测性与可用性反向耦合。**
+
+`logback-spring.xml` 的异步 appender 设了 `neverBlock=false` + `discardingThreshold=0`（注释写着"宁可慢，不可缺"）。整条反压链是：
+
+```
+ES 写入变慢 → Logstash 消费变慢 → Kafka 堆积 → Filebeat 队列(4096)满
+          → Filebeat 停止拉取 → Logback 队列(8192)满 → 业务线程阻塞在打日志上
+```
+
+也就是说，**日志后端的故障会顺着管道反向传导成应用的延迟**。可观测性组件的第一原则是"自身失效时降级、不反噬业务"，这里恰好相反。Demo 里这条链几乎不可能触发（流量太小），但它是结构性的：只要管道里有一跳会阻塞，反压迟早会走到应用。
+
+**S3｜只有采集，没有判断。**
+
+Prometheus 里没有 `rule_files`，没有 Grafana，没有 SLO 定义。三块面板都能"看"，但没有任何一条规则会在半夜叫醒人。
+监控与可观测性的分界线是"**有没有预先写下的判断**"：现在这套是数据库，不是监控。
+
+### 10.2 缺陷清单（16 条）
+
+按严重度排。P0 = 会引发事故或数据错误；P1 = 直接拖累排障效率或成本；P2/P3 = 演进债。
+
+| # | 级别 | 层 | 缺陷 | 证据 | 后果 |
+|---|---|---|---|---|---|
+| D01 | P0 | 安全 | Actuator 与业务同端口，且暴露 `loggers`/`metrics` | `application.yml:35`；`show-details: always`（:38） | 任何能访问业务端口的人可 POST `/actuator/loggers` 把 root 调到 DEBUG，打爆磁盘（低成本 DoS），健康详情外泄内部拓扑 |
+| D02 | P0 | 可用性 | 日志反压可阻塞业务线程 | `logback-spring.xml:70-72`（`neverBlock=false`、`discardingThreshold=0`） | 日志后端故障 → 应用延迟升高 → 雪崩；见 S2 |
+| D03 | P0 | 正确性 | `@Timed(percentiles=…)` 无效，`histogram=true` 却带来 69 个桶/组合 | 实测：`quantile=` 序列 **0 条**；`risk_check_seconds_bucket` **69 条**（`RiskService:23`、`OrderService:93`） | 想要的分位数没拿到，却付了约 70 倍序列成本；看板上"P99"永远查不出来 |
+| D04 | P1 | 一致性 | 双埋点源；`order.query` 只有指标没有 span | `OrderService:59-60`（双注解）、`:93`（仅 `@Timed`） | 链路盲区；改一个漏一个，且无编译期提示（见 S1） |
+| D05 | P1 | 基数 | HTTP 直方图 58 桶/组合；`http_server_requests_active` 122 条/组合 | 实测：524 条序列 / 60 族，仅 5 个接口（active 122、order_ 122、risk_ 72、quote_ 72、http 61、jvm 54） | 按 50 接口折算约 3 万序列，其中 `..._active` 一项就占 1.8 万；Prometheus 内存、查询、抓取体积线性上涨 |
+| D06 | P1 | 语义 | 同一概念两个属性名：手工 span 用 `inventory.sku`，注解用 `order.sku` | `OrderService:37` vs `:61` | Jaeger 按属性过滤会漏掉一半 span；跨团队无法约定查询口径 |
+| D07 | P1 | 指标设计 | 失败计数双写；命名时态不一致；`inflight` 用 Gauge | `BusinessMetrics:42`、`:74`、`:61` | `order_failed_total` 与 `order_failed_by_reason_total` 口径会漂移；Gauge 拿不到"卡了多久" |
+| D08 | P1 | 采集点 | 应用写文件 + 宿主机旁挂 Filebeat；gz 归档不读；Windows bind mount 事件不传播 | `logback:fileNamePattern`（gz）、`filebeat.yml:paths` | Filebeat 在滚动窗口内挂掉＝永久丢日志；本地与容器两种拓扑行为不一致 |
+| D09 | P1 | 幂等 | ES 无 `document_id`，管道是 at-least-once | `app-logs.conf:65` | Kafka 重投 / Logstash 重试会写重复文档，Kibana 计数虚高，排障时看到"重复的同一行" |
+| D10 | P2 | 生命周期 | 按天索引，无 data stream / ILM | `app-logs.conf:65` | 磁盘被最老索引吃掉，只能人工删；删除期间查询会抖动 |
+| D11 | P2 | 自监控 | collector 自身指标未暴露、无 healthcheck 接入；Prometheus 单 target 写死宿主域名 | `otel-collector/config.yaml`（telemetry 注释）、`prometheus.yml` 静态 `targets` | collector 挂了没人知道；应用进容器就得手改配置（注释里那句"改成 app:8080"就是证据） |
+| D12 | P2 | 版本漂移 | `service.version` 在 Dockerfile、logback、pom 三处各自硬编码 | `Dockerfile:35`、`logback-spring.xml:44` | 发版后 Kibana/Jaeger 里的版本标签是错的，按版本筛选失效 |
+| D13 | P2 | 采样 | 100% 采样（`traceidratio=1.0`），无 tail sampling | `Dockerfile`、`scripts/run-local.sh` | 流量上来后 collector 与 Jaeger 先崩；存储成本随 QPS 线性涨 |
+| D14 | P2 | 盲区 | 只有 JVM/HTTP 指标；无容器 CPU throttling、无下游依赖指标 | 全量清单（§2.6）里没有 `container_*`，也没有 `http_client_*` | 最常见的延迟根因（cgroup 限流、下游慢）在面板上不可见 |
+| D15 | P3 | 验证 | exemplar storage 的可用性只在注释里断言，栈从未真正启动过 | `prometheus.yml:38`（"v3 默认已开启"） | 注释被后来人当事实；换版本即失效，而且没人会发现 |
+| D16 | P3 | 成本 | 每条日志走两个 appender（console 同步 + 文件异步），INFO 全量、无采样 | `logback:19`、`:74` | 每事件两次格式化 + 两份 IO；按 §10.10 的量级估算，日志是最大的成本项 |
+
+#### 10.2.1 三条 P0 的详细说明
+
+**D01：`loggers` 端点为什么是 P0。**
+它不是一个"只读"端点。`POST /actuator/loggers/{name}` 带 `{"configuredLevel":"TRACE"}` 就能改运行期日志级别，而且**不需要重启、没有审计**。配合 `show-details: always` 的健康端点（会吐出数据库、磁盘、下游探针的细节），一台被扫描到的机器就等于把内部结构交出去。
+修法不是"藏路径"，而是三层：
+
+```yaml
+management:
+  server:
+    port: 8081              # ① 管理端口与业务端口分离，可单独做网络策略
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus   # ② 只开需要的
+  endpoint:
+    health:
+      show-details: never            # ③ 详情只给内网探针看
+    loggers:
+      access: none                   # ④ Boot 4 的端点级开关（none / read-only / unrestricted）
+```
+
+第 ④ 项是 Boot 4 才有的能力：`management.endpoint.<id>.access` 直接决定端点可读、可写还是关闭（默认 `unrestricted`）。它比"从 exposure 列表里删掉"更硬——即使有人后续放宽了 exposure，写权限仍然是关的。
+
+**D02：反压链怎么断。**
+两个方向，选一个：
+
+- **应用侧永不阻塞**：`neverBlock=true`。队列满时丢日志，然后用一个自定义 appender 或 `logback_events_total` 的差值把"丢了多少"暴露成指标。丢日志是可见的降级，阻塞请求是不可见的故障。
+- **取消应用侧队列**：只写 stdout，让容器运行时去背压（它的背压策略由平台决定，不会占用业务线程）。这也是 10.6 推荐的做法——**队列是缓冲，不是保险**，有队列就一定会在某处堆满。
+
+**D03：为什么配了 `percentiles` 却没有分位数。**
+这不是本工程的 bug，是 Micrometer 1.13 之后的规范行为：新的 Prometheus 客户端不允许同一个指标族同时输出 histogram 和 quantile（Prometheus/OpenMetrics 规范也不允许），Micrometer 选择保留 histogram、**丢弃 quantile**。所以：
+
+```java
+// 想要 P99 的正确写法：只给 SLO 边界，让 Prometheus 用 histogram_quantile 算
+@Timed(value = "risk.check", histogram = true)   // percentiles 删掉
+// 或者：给 SLO，桶数从 69 降到 3
+```
+
+代价是"分位数不再由应用算"，好处是**可以跨实例聚合**——10 个实例各自的 P99 求平均不是全局 P99，而 `histogram_quantile(sum by (le) (rate(...)))` 是。这条取舍在本工程的 §2.4 讲过，但代码里没落实，属于"文档对了、实现没跟上"。
+
+### 10.3 如果我来设计：先立 4 条原则
+
+这 4 条不是口号，每条都能反向否掉一个具体设计：
+
+| 原则 | 含义 | 否掉什么 |
+|---|---|---|
+| ① 单一埋点源 | 一次埋点同时产出指标与 span，不给"两套注解"留空间 | 否掉 `@Observed` + `@WithSpan` 双写；否掉"指标有、链路没有"的盲区 |
+| ② 采集点收敛 | 应用只负责"输出"，不负责"搬运"；采集器只做一类事 | 否掉"应用写文件 + 宿主机旁挂 Filebeat"；否掉应用内异步队列 |
+| ③ 判断先于采集 | 先写告警规则和 SLO，再决定采什么指标 | 否掉"先接一堆指标以后再说"；直接砍掉没人查的指标族 |
+| ④ 观测量有预算 | 序列数、日志量、trace 采样率都是预算，超了要审批 | 否掉 58 桶直方图、69 桶注解、100% 采样、INFO 全量 |
+
+### 10.4 目标形态（一页图）
+
+```mermaid
+flowchart LR
+    subgraph APP["应用进程：单一埋点源"]
+        OBS["Observation / @Observed"]
+        OBS --> MET["MeterRegistry"]
+        OBS --> TRC["Tracer (Bridge)"]
+        LOG["SLF4J → JSON → stdout"]
+    end
+
+    MET -->|"pull 15s<br/>:8081/actuator/prometheus"| PROM["Prometheus"]
+    PROM --> RULE["recording + alert rules"]
+    RULE --> AM["Alertmanager"]
+    PROM --> GRAF["Grafana（唯一入口）"]
+
+    TRC -->|"OTLP gRPC"| COL["Collector<br/>tail_sampling + spanmetrics"]
+    COL --> JAEGER["Jaeger / Tempo"]
+    COL -->|"spanmetrics"| PROM
+
+    LOG -->|"stdout / filelog"| COL2["Collector (logs)"]
+    COL2 --> ES["ES data stream + ILM"]
+    ES --> KIB["Kibana"]
+
+    GRAF -.->|"exemplar → trace_id"| JAEGER
+    KIB -.->|"trace.id 链接"| JAEGER
+```
+
+与现在的差别只有三处，但都是结构性的：
+
+1. **应用侧只有一条埋点路径**（Observation），指标和 span 由同一次观测派生；
+2. **日志不再绕 4 跳**，应用只写 stdout，Collector 直接进 ES（Kafka 在需要 fan-out/回放时再加）；
+3. **Grafana 作为唯一入口**，三支柱在同一个界面里互相跳转，而不是三个 UI 各看各的。
+
+### 10.5 核心改动：单一埋点源怎么做
+
+Boot 4 恰好把这件事做成了"加一个 starter"：`spring-boot-starter-opentelemetry` 里已经包含了
+`micrometer-tracing-bridge-otel` + `opentelemetry-exporter-otlp` + `micrometer-registry-otlp`（我拉了 4.1.1 的 POM 确认过），
+也就是说**不需要 javaagent 也能拿到 OTel 的 span 能力**，而且它和 Micrometer 是同一套 Observation 模型。
+
+#### 10.5.1 两种路线的取舍
+
+| 维度 | 现状：javaagent 优先 | 备选：Observation 优先（推荐给新工程） |
+|---|---|---|
+| 代码侵入 | 零（框架 span 全自动） | 一个注解 / 一行 API |
+| 框架与三方库覆盖 | **强**：JDBC、Redis、HTTP client、MQ 全有 | 中：Spring 生态由 Boot 自动配置覆盖，三方客户端要手写 |
+| 指标与链路同源 | **否**，两套注解（S1 的根源） | **是**，一次 Observation 派生两者 |
+| 高基数标签 | 只能进 span 或只能进 meter | `highCardinalityKeyValue` 只进 trace，不进 metric（天然分流） |
+| 采样与资源属性 | 环境变量，容器外黑盒 | `application.yml` 统一，随代码评审 |
+| 升级风险 | 换 jar，行为变化看不见 | 换依赖，编译期可见 |
+| 存量系统接入 | **零成本**（多服务、多语言栈首选） | 要改代码，适合新工程或核心服务 |
+| exemplar | 需要手写 `SpanContext` 桥（本工程 §5.2） | 内置，`management.tracing.exemplars.include` 默认 `sampled-traces` |
+
+**决策规则**（我在实际项目里用的）：新工程、服务数少于 10、以 Spring 生态为主 → Observation 优先；存量几十个服务、大量三方客户端、跨语言 → 继续用 agent，但必须补一条规约：**同一方法只允许一种埋点注解**，指标和 span 用同一个名字，评审时对照检查。
+
+#### 10.5.2 落地配置（属性名已在 4.1.1 的 `configuration-metadata` 里核对）
+
+```yaml
+management:
+  otlp:
+    metrics:
+      export:
+        enabled: false            # 指标仍走 Prometheus pull，不重复上报 OTLP
+  tracing:
+    sampling:
+      probability: 0.1            # head 采样 10%，错误链路交给 collector 的 tail sampling 兜
+    exemplars:
+      include: sampled-traces     # 默认值，写出来是为了让人知道有这回事
+  opentelemetry:
+    resource-attributes:
+      service.namespace: hello
+      deployment.environment: ${APP_ENV:local}
+    tracing:
+      export:
+        otlp:
+          endpoint: http://otel-collector:4317
+```
+
+两个 Boot 4 的坑要提前说：
+
+- `management.logging.export.otlp.enabled` **默认是 true**。引入 starter 后如果不显式关掉，日志会额外走一条 OTLP 通道，与文件采集重复（正是本工程反复强调的"一份数据两条通道"）。要么关掉，要么就把日志彻底交给 OTLP（见 10.6.3）。
+- 引入了 bridge 就**不要再挂 javaagent**：两个 TracerProvider 会让 span 分裂成两条链路（推断，未在本工程实测；如果你要混用，先确认只有一个 SDK 在导出）。
+
+#### 10.5.3 代码形态：一次埋点，两种产物
+
+```java
+// 注解式：注入 span + 计时指标，名字只写一遍
+@Observed(name = "order.place", contextualName = "place-order",
+          lowCardinalityKeyValues = {"channel", "http"})
+public OrderResult place(String sku, int qty) { ... }
+
+// 编程式：高基数信息只进 trace，不进指标
+Observation.createNotStarted("inventory.reserve", observationRegistry)
+        .lowCardinalityKeyValue("warehouse", "SH-01")     // 有限枚举 → 进指标
+        .highCardinalityKeyValue("inventory.sku", sku)    // 无上限 → 只进 span
+        .observe(() -> doReserve(sku, qty));
+```
+
+`highCardinalityKeyValue` 是这套模型最值钱的地方：**它把"我想在链路里看到 sku"和"我不想让 sku 变成指标标签"这两件事同时满足了**。现在的双源方案做不到——要么把 sku 放进 meter 标签（基数爆炸），要么放进 span 属性（指标里没有），只能二选一。
+
+### 10.6 三条通道的目标形态
+
+#### 10.6.1 指标：先把桶和端点管住
+
+| 项 | 现状 | 目标 | 收益 |
+|---|---|---|---|
+| 暴露端点 | 业务端口 8080 | `management.server.port=8081` | 可独立做网络策略；抓取流量不占业务线程池 |
+| HTTP 直方图 | 58 桶/组合（`percentiles-histogram` + `slo` + `min/max-expected-value` 三者取并集） | 只留 SLO 7 桶 | 序列数降约 8 倍 |
+| 注解 Timer | 69 桶/组合 | 只留 3 个 SLO 或干脆不做方法级直方图 | 序列数降 20 倍以上 |
+| `..._active` | 122 条/组合且 `uri=UNKNOWN` | `management.metrics.enable."[http.server.requests.active]"=false` | 直接省掉 20%+ 序列 |
+| 判断 | 无规则 | 4 条告警 + 2 条 recording rule | 从"能看"变成"会叫" |
+| 盲区 | 无容器/下游指标 | cAdvisor + `http.client.requests` + collector `spanmetrics` | 补齐最常见的两个根因 |
+
+```yaml
+management:
+  metrics:
+    distribution:
+      slo:
+        "[http.server.requests]": 50ms,100ms,200ms,500ms,1s,2s,5s   # 只要这个
+        # 不写 percentiles-histogram / minimum-expected-value / maximum-expected-value
+    enable:
+      "[http.server.requests.active]": false
+```
+
+告警规则（`prometheus/rules/slo.yml`，现在完全没有这个文件）：
+
+```yaml
+groups:
+  - name: slo
+    rules:
+      - alert: ScrapeDown                     # 抓取断了，比指标异常更早发生
+        expr: up{job="hello-observability"} == 0
+        for: 2m
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m])) by (service)
+            / sum(rate(http_server_requests_seconds_count[5m])) by (service) > 0.01
+        for: 10m
+      - alert: SlowP99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, service) (rate(http_server_requests_seconds_bucket[5m]))) > 1
+        for: 10m
+      - alert: HeapPressure                   # 用 live data，不要用 used/max（Eden 是 -1）
+        expr: jvm_gc_live_data_size_bytes / jvm_gc_max_data_size_bytes > 0.85
+        for: 15m
+```
+
+#### 10.6.2 链路：采样与命名规范
+
+- **采样分两层**：应用侧 head 5~10%（成本可控），collector 侧 tail sampling 兜住"全都要"的三类：`status=ERROR`、耗时 > P99、特定租户/灰度流量。现在 100% 采样，等于把"选择权"交给了流量。
+- **span 名不含变量**：`inventory.reserve` 而不是 `inventory.reserve.A-100`（后者会在 Jaeger 里炸出无数 operation）。
+- **属性名走 semconv**：`http.request.method`、`db.system`、`messaging.system` 这些别自己造；业务实体名也要统一（D06 的反例）。建议在仓库里放一份 `docs/observability-naming.md`，评审时对照。
+- **`spanmetrics` connector**：从 span 里直接生成 RED 指标（`traces.span.metrics.calls_total` 等），补上"指标里看不到的非 HTTP 操作"。这也是把 trace 和 metric 拉回同一套口径的低成本手段。
+
+#### 10.6.3 日志：先砍跳数，再谈格式
+
+现状是 4 跳（Filebeat → Kafka → Logstash → ES）。每一跳都合理，合在一起是"每跳都能坏一次"。
+
+| 规模 | 建议形态 | 跳数 |
+|---|---|---|
+| 单服务 / 学习 / 中小规模 | 应用写 stdout → Collector `filelog`（或容器日志驱动）→ ES data stream | 1 |
+| 需要 fan-out、回放、多消费者 | 保留 Kafka，但把 Logstash 的"改名归并"挪到 Collector 或索引模板里 | 2~3 |
+| 合规要求冷备 | Kafka → 对象存储（S3/MinIO）旁路 | 3+ |
+
+不管哪一档，三件事必须做：
+
+1. **字段用 ECS**（`log.level`、`service.name`、`trace.id`、`span.id`、`@timestamp`）。现在是自定义字段 + Logstash 改名（`trace_id → [trace][id]`），多一跳就多一个"字段名对不上"的故障点。
+2. **`document_id` 去重**：`log.file.path + log.offset`（filebeat 自带）或 `trace.id + span.id + 时间戳`。at-least-once 不做去重，Kibana 里就会出现重复行。
+3. **索引生命周期**：data stream + ILM（热 7d / 温 30d / 删 90d）。按天索引不删，磁盘一定会满，而且是在你没注意的那天满。
+
+另外一个 Boot 4 的新选项值得知道：`management.opentelemetry.logging.export.otlp.*` 让 **日志也能走 OTLP**，与 trace 共用一条通道、共用 resource 属性。代价是应用侧多一个日志 appender（仍有队列），收益是"一条管道三种信号"，采集侧可以只维护 Collector 一个组件。中小规模下这是我最愿意选的形态；大规模下（>10 GB/天）仍然建议日志走独立的低成本通道，别和 trace 抢带宽。
+
+### 10.7 关联：现在只通了三分之一
+
+| 方向 | 现状 | 目标 |
+|---|---|---|
+| 指标 → 链路 | ✅ exemplar 带 `trace_id` | 保持；Prometheus 侧确认 exemplar 存储真的开着（见 D15） |
+| 链路 → 日志 | ❌ | Jaeger/Tempo 的 trace 详情页配 `tracesToLogs`（按 `trace.id` 跳 Kibana） |
+| 日志 → 链路 | ❌ | Kibana data view 把 `trace.id` 配成 URL 模板，一键跳回 trace |
+| 客户端 → 全链路 | 仅响应体带 `traceId` | 加响应头 `X-Trace-Id`（网关、前端、Nginx 日志都能记），前端报障直接带上来 |
+
+关联做全了，排障动作才是"三步"：看板发现慢 → 点 exemplar 进 trace → 从 trace 跳到该请求的全部日志。少一个箭头，就多一次人工搜索。
+
+### 10.8 工程化：把可观测性当代码来测
+
+这是本工程最该补的一块，也是那个 `@Timed` 静默失效 bug 能溜进仓库的**根本原因**——观测行为没有测试，只有"我手动 curl 看了一眼"。
+
+```java
+@SpringBootTest
+class ObservabilityContractTest {
+
+    @Autowired OrderService orderService;
+    @Autowired PrometheusMeterRegistry prometheus;
+
+    /** 契约 1：业务方法必须留下指标。这条断言能直接抓住"切面没装" */
+    @Test
+    void place_should_publish_timer() {
+        orderService.place("A-100", 2);
+        assertThat(prometheus.find("order.place").timer()).isNotNull();
+    }
+
+    /** 契约 2：序列数不得超预算——把"基数"从口头约束变成 CI 红线 */
+    @Test
+    void series_budget() {
+        long series = prometheus.scrape().lines().filter(l -> !l.startsWith("#")).count();
+        assertThat(series).isLessThan(2_000);
+    }
+}
+```
+
+再补两类：
+
+- **span 断言**：`TestObservationRegistry`（`micrometer-observation-test`）断言 `hasObservationWithNameEqualTo("order.place")`；要断言真实 span 结构就用 `opentelemetry-sdk-testing` 的 `InMemorySpanExporter`。
+- **日志断言**：Logback 的 `ListAppender` 抓 `ILoggingEvent`，断言 MDC 里有 `trace_id`。
+
+CI 里再加四条静态校验（成本几乎为零，能挡住 90% 的"配置写错了但没人知道"）：
+
+```bash
+promtool check config docker-stacks/obs-stack/prometheus/prometheus.yml
+promtool check rules  docker-stacks/obs-stack/prometheus/rules/*.yml
+docker run --rm -v "$PWD/docker-stacks/obs-stack/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml" \
+  otel/opentelemetry-collector-contrib:0.115.0 validate --config=/etc/otelcol-contrib/config.yaml
+docker compose -f docker-stacks/obs-stack/compose.yaml config -q
+```
+
+再加一份 5 条的**变更评审清单**（放到 `AGENTS.md` 或 PR 模板里）：
+
+1. 新增指标了吗？标签全是有限枚举吗？序列预算加了多少？
+2. 新增 span 了吗？名字不含变量吗？属性名在 semconv 字典里吗？
+3. 日志里有没有可能出现手机号、身份证、token？（有就脱敏，别等出事）
+4. 这个改动会让哪条告警失效吗？（改指标名 = 隐式删告警）
+5. 观测组件挂了，业务还能跑吗？
+
+### 10.9 落地路线
+
+不是"一次重构"，而是三阶段，每阶段都有可验证的产出：
+
+| 阶段 | 动作 | 验收标准 |
+|---|---|---|
+| 第 1 周（止血） | D01 管理端口隔离 + 只暴露 health/prometheus；D02 `neverBlock=true` + 丢弃计数；D03 删 `percentiles`、关 `..._active`、只留 SLO 桶；D07 合并失败计数 | 序列数从 524 降到 200 以内（`..._active` 122 条 + HTTP 58→7 桶 + 注解 Timer 69→3 桶）；`/actuator/loggers` 不可写；压测时停掉日志后端，请求 P99 不变 |
+| 第 1 月（闭环） | 加 `prometheus/rules/slo.yml` + Alertmanager；Grafana 三个看板（JVM/HTTP/业务）；D09 `document_id` + D10 ILM；补 10.8 的 2 个契约测试 | 人为造 5xx 能收到告警；Kibana 里同一 trace 的日志无重复；CI 里能拦住序列超预算 |
+| 第 1 季度（规模化） | 迁到 Observation 单源（10.5）；采样改 head 10% + tail；日志砍到 1 跳或迁 OTLP；补 cAdvisor + `http.client.requests`；D12 版本单一来源 | 单实例 span 量降 90%；新增一个接口的观测成本≈0（只加注解不改管道）；版本标签与实际发版一致 |
+
+### 10.10 成本账：为什么"多采一点"不是免费的
+
+以下按假设估算（不是实测），但量级足够说明问题。
+
+| 项 | 现状 | 改后 | 假设 |
+|---|---|---|---|
+| 指标序列 | ≈ 3.1 万（50 接口 × 3 状态码折算：HTTP 直方图 9.1k + `..._active` 18.3k + 20 个注解 Timer 2.2k + JVM 等 60） | ≈ 1.7 千 | 单实例；`histogram_quantile` 仍可用 |
+| Trace（span/天） | 8600 万 | 430 万 | 200 QPS × 5 span/请求；100% → 5% 采样 |
+| Trace 存储（天） | ≈ 43 GB | ≈ 2 GB | 每 span ≈ 500 B（含属性） |
+| 日志（原始/天） | ≈ 14 GB | ≈ 3.5 GB | 200 QPS × 2 条 × 400 B；改后 INFO 按 trace 采样 |
+| 日志（ES 压缩后/天） | ≈ 2.3 GB 主分片 | ≈ 0.6 GB | gzip 约 6 倍；不含副本 |
+
+结论：**不加预算的"全采"在 200 QPS 量级就会吃掉几十 GB/天**，其中 trace 和日志是大头，指标序列反而排第三。所以采样率和日志级别应该是设计参数，不是运维事故之后才想起来调的东西。
+
+### 10.11 本章小结
+
+> - 这套工程的**原理是通的、验证是实的**（exemplar、MDC、span 树都跑出来了），但它是"教学形态"：双埋点源、日志 4 跳、零告警，这三点决定了它不能直接照搬上生产。
+> - 最该改的不是某个配置项，而是**埋点的组织结构**：一次 Observation 派生指标与 span，比"两套注解写得一样"可靠一个数量级。
+> - 可观测性必须有预算：序列、span、日志字节都是成本，预算要写进测试和 CI，而不是写在文档里。
+> - 观测量本身也要被观测：管道有没有断、collector 有没有活、exemplar 有没有真的存下来——**注释不算证据，跑一遍才算**。
+> - 如果只记一条：先写告警和 SLO，再决定采什么。反过来做，一定会采一堆没人看的数据。
 
 ---
 
