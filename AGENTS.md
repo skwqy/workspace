@@ -41,6 +41,7 @@ cmd/PowerShell 跑不了 `.sh`——用 `.cmd` 双击版或 `bash <脚本>`；�
 |---|---|---|
 | `hello-world\` | Boot 4.1.1 纯 Web：Dockerfile 模板 A（多阶段+分层）、逐行对照表、全流程 README | **纯 Web 项目从它复制**；Dockerfile 写法以它为准 |
 | `hello-component\` | Boot 4.1.1 + MySQL/Redis/Kafka 串联：JPA、双 listener、数据资产清单（表 DDL/Topic/Redis Key 见其 README §三 与 `db/schema.sql`）、Postman 集合（`postman\*.json`） | **要连中间件的项目从它复制** |
+| `hello-observability\` | Boot 4.1.1 观测体系：Micrometer→Prometheus pull（15s）、OTel javaagent→collector→Jaeger、Logback→Filebeat→Kafka→Logstash→ES→Kibana；`docker-stacks\obs-stack` 是配套后端栈 | **要接观测三件套的项目从它复制**；指标/链路/日志的埋点与配置以它为准 |
 
 新项目套路：复制模板 → 改 groupId/artifactId/包路径 → 接口配 Postman 集合 → 数据资产（表 DDL/Topic/Key）写进 README。
 
@@ -56,6 +57,9 @@ cmd/PowerShell 跑不了 `.sh`——用 `.cmd` 双击版或 `bash <脚本>`；�
 8. **高危命令**：`docker compose down -v`、`docker system prune -a --volumes` 删数据——未经用户确认不得执行；日常停栈只用 `docker compose stop`。
 9. 应用容器连宿主机上的服务用 `host.docker.internal`（容器里的 localhost 是它自己）。
 10. 休眠唤醒后容器网络异常/命令卡死 → `wsl --shutdown` 后重开 Docker Desktop。
+11. **Boot 4 把 `spring-boot-starter-aop` 改名为 `spring-boot-starter-aspectj`**——老名已不在 BOM 里，写上直接报 `version is missing`；`@Observed` 还需要自己声明 `ObservedAspect` bean（默认不装配）。
+12. **别自己 new `PrometheusMeterRegistry` 来加 exemplar**——端点用的是 Boot 自己的 `PrometheusRegistry` bean，两个实例会导致 `/actuator/prometheus` 返回 200 但内容为空；只需提供 `io.prometheus.metrics.tracer.common.SpanContext` bean。
+13. **OTel agent 下载走阿里云 Maven 镜像**（`io/opentelemetry/javaagent/opentelemetry-javaagent`），GitHub Release 的二进制域名国内常断流，见 `hello-observability/scripts/fetch-otel-agent.sh`。
 
 ## 6. 参考文档（按需查阅，均在 `D:\ai\tools\`）
 
