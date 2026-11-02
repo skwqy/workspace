@@ -1,0 +1,16 @@
+target/
+*.class
+
+.idea/
+*.iml
+
+# 运行期日志（JSON 落地目录）
+logs/
+
+# OTel agent 由 scripts/fetch-otel-agent.sh 下载，不进仓库
+otel-agent/*.jar
+otel-agent/*.sha256
+
+.env
+Thumbs.db
+.DS_Store

@@ -1,0 +1,165 @@
+{
+  "info": {
+    "name": "hello-observability",
+    "_postman_id": "6f0f2a1e-6b0c-4a1e-9a9e-000000000001",
+    "description": "可观测性样例工程的接口集合：正常/拒绝/404/慢/异常/并发六种场景",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    }
+  ],
+  "item": [
+    {
+      "name": "健康检查",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/actuator/health"
+      }
+    },
+    {
+      "name": "指标端点（Prometheus 文本格式）",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/actuator/prometheus",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/openmetrics-text;version=1.0.0",
+            "description": "OpenMetrics 才有 exemplar（trace_id）"
+          }
+        ]
+      }
+    },
+    {
+      "name": "下单成功 qty=2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"sku\":\"A-100\",\"qty\":2}"
+        },
+        "url": "{{baseUrl}}/api/orders"
+      }
+    },
+    {
+      "name": "下单被风控拒绝 qty=60（422）",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"sku\":\"A-100\",\"qty\":60}"
+        },
+        "url": "{{baseUrl}}/api/orders"
+      }
+    },
+    {
+      "name": "库存不足 qty=30（409，span 带 ERROR）",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"sku\":\"A-100\",\"qty\":30}"
+        },
+        "url": "{{baseUrl}}/api/orders"
+      }
+    },
+    {
+      "name": "参数校验失败（400）",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"sku\":\"\",\"qty\":0}"
+        },
+        "url": "{{baseUrl}}/api/orders"
+      }
+    },
+    {
+      "name": "查单 404",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/api/orders/MISS-1"
+      }
+    },
+    {
+      "name": "慢请求",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/demo/slow?ms=800",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "demo",
+            "slow"
+          ],
+          "query": [
+            {
+              "key": "ms",
+              "value": "800"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "未捕获异常（500）",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/api/demo/fail"
+      }
+    },
+    {
+      "name": "虚拟线程并发扇出",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/demo/fanout?n=8",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "demo",
+            "fanout"
+          ],
+          "query": [
+            {
+              "key": "n",
+              "value": "8"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

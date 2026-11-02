@@ -1,0 +1,14 @@
+# 构建上下文瘦身：只送 jar 进镜像
+.git
+.idea/
+*.iml
+HELP.md
+logs/
+target/classes/
+target/test-classes/
+target/maven-status/
+target/surefire-reports/
+scripts/
+postman/
+README.md
+.env

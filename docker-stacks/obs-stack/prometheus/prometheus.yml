@@ -1,0 +1,40 @@
+# =====================================================================================
+# Prometheus —— pull 模式的"外界调用方"
+#   本文件最关键的一行是 scrape_interval: 15s：它决定了应用侧指标的时间粒度。
+#   pull 模型下，"外界每 15s 调一次"就是 Prometheus 的抓取周期，应用不需要知道有谁在看。
+# =====================================================================================
+
+global:
+  scrape_interval: 15s          # 与需求一致：每 15s 抓一次
+  scrape_timeout: 10s           # 必须 < scrape_interval，否则上一轮还没超时就撞上下一轮
+  evaluation_interval: 15s      # 告警规则求值周期
+  external_labels:
+    cluster: local-docker
+    env: dev
+
+scrape_configs:
+  # ---- 应用本体：Spring Boot Actuator 的 Prometheus 端点 ----
+  - job_name: hello-observability
+    metrics_path: /actuator/prometheus
+    scheme: http
+    scrape_interval: 15s
+    static_configs:
+      # 应用跑在宿主机（推荐的学习姿势）：走 Docker Desktop 的特殊域名
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: hello-observability
+      # 若用 compose 的 app profile 把应用也塞进容器，改成下面这行（并注释掉上面那行）
+      # - targets: ["app:8080"]
+      #   labels:
+      #     service: hello-observability
+
+  # ---- Prometheus 自身（元监控：抓取是否健康、抓取耗时） ----
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+# 说明：
+# 1) exemplar（指标→trace 跳转）依赖 Prometheus 的 exemplar storage，
+#    v3 默认已开启（--enable-feature=exemplar-storage 曾需显式打开）；
+#    查询示例：histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket[5m])))
+# 2) 生产应加 rule_files（SLO burn rate 告警）与 remote_write（长期存储）

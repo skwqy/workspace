@@ -1,0 +1,211 @@
+# =====================================================================================
+# obs-stack：可观测性后端全家桶
+#   链路：otel-collector(OTLP gRPC 4317) → jaeger(UI 16686)
+#   指标：prometheus 每 15s 主动 pull 应用 /actuator/prometheus
+#   日志：filebeat(挂宿主机日志目录) → kafka → logstash → elasticsearch → kibana
+#
+# 端口全部 127.0.0.1 + 非默认值，避免和 study-stack（3306/6379/9092）打架。
+# 起法：bash docker-stacks/startup-all.sh   （会自动拉起本目录下的所有 compose）
+# 或   ：docker compose -f docker-stacks/obs-stack/compose.yaml up -d
+# =====================================================================================
+name: obs-stack
+
+services:
+  # ------------------------------------------------------------------ Kafka（日志总线）
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: obs-kafka
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19092:19092"        # 宿主侧客户端（可选）
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data          # ⚠️ 官方镜像默认在 /tmp，不显式指定则容器重建丢数据
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # 双 listener：PLAINTEXT 给容器内（filebeat/logstash），EXTERNAL 给宿主机
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"    # 关闭自动建 topic，由 kafka-init 显式建（可控分区数/保留期）
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # 一次性任务：显式建日志 topic（幂等，重复执行不报错）
+  kafka-init:
+    image: apache/kafka:4.0.0
+    container_name: obs-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic app-logs \
+          --partitions 3 --replication-factor 1 \
+          --config retention.ms=259200000 \
+          --config cleanup.policy=delete
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic app-logs
+    restart: "no"
+
+  # ------------------------------------------------------------------ 链路后端
+  jaeger:
+    image: jaegertracing/jaeger:2.1.0        # Jaeger v2：内建 OTLP 接收器，UI 在 16686
+    container_name: obs-jaeger
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:16686:16686"
+    environment:
+      # v2 默认内存存储，重启即丢 trace；生产换 badger/cassandra/clickhouse
+      COLLECTOR_OTLP_ENABLED: "true"
+    mem_limit: 512m
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    container_name: obs-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"       # OTLP gRPC：应用 agent 在这里上报
+      - "127.0.0.1:4318:4318"       # OTLP HTTP：手工 curl 验证用
+    depends_on:
+      - jaeger
+    mem_limit: 512m
+
+  # ------------------------------------------------------------------ 指标后端
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: obs-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle        # 支持 POST /-/reload 热加载配置
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:19090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux 引擎兜底；Docker Desktop 自带
+    mem_limit: 512m
+
+  # ------------------------------------------------------------------ 日志后端
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: obs-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"     # 仅本地学习；生产必须开 TLS + 账号
+      xpack.ml.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      bootstrap.memory_lock: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "127.0.0.1:19200:9200"
+    mem_limit: 1536m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.3
+    container_name: obs-logstash
+    restart: unless-stopped
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+      # 关闭 xpack 监控上报，省资源也省得报错
+      XPACK_MONITORING_ENABLED: "false"
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    ports:
+      - "127.0.0.1:19600:9600"       # Logstash 自身监控 API
+    depends_on:
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    mem_limit: 1g
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: obs-kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      XPACK_SECURITY_ENABLED: "false"
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "127.0.0.1:15601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    mem_limit: 1g
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.3
+    container_name: obs-filebeat
+    restart: unless-stopped
+    user: root                        # 读宿主机挂进来的日志目录，避免权限问题
+    command: ["filebeat", "-e", "-strict.perms=false"]
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      # 宿主机上的应用日志目录（默认是示例工程的 logs/），只读挂载
+      - ${APP_LOG_DIR:-../../hello-observability/logs}:/var/log/app:ro
+      - filebeat-data:/usr/share/filebeat/data
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 256m
+
+  # ------------------------------------------------------------------ 应用本体（可选）
+  # 默认不启动；要"一条命令连应用一起跑"就加 --profile app
+  app:
+    profiles: ["app"]
+    build:
+      context: ../../hello-observability
+      dockerfile: Dockerfile
+    container_name: obs-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      APP_ENV: docker
+      # 与应用配置同名的日志目录，filebeat 通过同一宿主机目录采集
+      LOG_PATH: /var/log/app
+    volumes:
+      - ../../hello-observability/logs:/var/log/app
+    depends_on:
+      - otel-collector
+    mem_limit: 768m
+
+volumes:
+  kafka-data:
+  es-data:
+  prometheus-data:
+  filebeat-data:

@@ -1,0 +1,86 @@
+# =====================================================================================
+# otel-collector 配置（contrib 发行版 0.115.0）
+# 职责：收 OTLP（gRPC/HTTP）→ 统一处理 → 转给 Jaeger
+# 刻意不接指标/日志：指标走 Prometheus pull、日志走 Filebeat 旁路，collector 只管链路
+# =====================================================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 16
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 内存保护：超限先丢数据保进程。放在 pipeline 第一位
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 70
+    spike_limit_percentage: 20
+
+  # 敏感信息清洗：Authorization/Cookie 绝不能进 trace 存储
+  attributes/scrub:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.request.header.cookie
+        action: delete
+      - key: http.request.header.set_cookie
+        action: delete
+
+  # 补齐资源属性：agent 没配的兜底（insert 表示"没有才加"，不覆盖应用侧的值）
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: dev
+        action: insert
+      - key: service.namespace
+        value: hello
+        action: insert
+
+  # 批量：小包合并成大包，显著降低 exporter 的 RPC 次数
+  batch:
+    timeout: 5s
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+exporters:
+  # Jaeger v2 原生收 OTLP；容器内网直连，不需要 TLS
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+    # 生产建议打开重试与队列，避免下游抖动放大成数据丢失
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+
+  # 排障开关：想确认"到底有没有数据进来"，把下面这段取消注释并加进 traces pipeline
+  # debug:
+  #   verbosity: detailed
+
+service:
+  extensions: [health_check, zpages]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/scrub, resource, batch]
+      exporters: [otlp/jaeger]
+
+  telemetry:
+    logs:
+      level: info
+    # collector 自身指标默认只在 127.0.0.1:8888，容器外看不到，这里不额外暴露：
+    # 需要采集 collector 自身健康度时，加一个 prometheus exporter + 独立 metrics pipeline 更清晰

@@ -1,0 +1,76 @@
+# =====================================================================================
+# hello-observability 应用配置
+#   指标：Micrometer → /actuator/prometheus（Prometheus 每 15s 来 pull）
+#   链路：opentelemetry-javaagent（配置在启动参数/环境变量，不在本文件）
+#   日志：Logback（见 logback-spring.xml）→ JSON 文件 → Filebeat
+# =====================================================================================
+spring:
+  application:
+    name: hello-observability
+  threads:
+    # 打开虚拟线程：请求处理线程不再是平台线程，日志里 thread 字段会是 VirtualThread 样式
+    virtual:
+      enabled: true
+
+server:
+  port: 8080
+  shutdown: graceful
+
+app:
+  env: ${APP_ENV:local}
+
+logging:
+  level:
+    root: INFO
+    com.example.obs: INFO
+    # 想看清 agent 注入 MDC 的过程可以打开下面两行
+    # io.opentelemetry: DEBUG
+    # org.springframework.boot.actuate.autoconfigure: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # prometheus 是 pull 的入口；metrics 便于随手排查指标名，生产可只留 health,prometheus
+        include: health,info,prometheus,metrics,loggers
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  info:
+    env:
+      enabled: true
+  metrics:
+    tags:
+      # 全局公共标签：所有指标都会带上，便于多服务/多环境聚合。
+      # ⚠️ 千万不要在这里写 instance —— Prometheus 抓取时会用 target 自动生成 instance 标签，
+      #    两者撞名会被改写成 exported_instance，查询时非常容易踩坑。
+      application: ${spring.application.name}
+      env: ${APP_ENV:local}
+    distribution:
+      # 直方图（bucket）是算 P99 的前提：没有 bucket 时 Prometheus 只能算平均值
+      percentiles-histogram:
+        "[http.server.requests]": true
+        "[order.place]": true
+      # SLO 定桶：只保留业务真正关心的边界，避免桶太多导致时序数量爆炸
+      slo:
+        "[http.server.requests]": 50ms,100ms,200ms,500ms,1s,2s,5s
+        "[order.place]": 100ms,300ms,1s
+      # 小样本抖动抑制：低于 5ms 的一律并进最低桶
+      minimum-expected-value:
+        "[http.server.requests]": 5ms
+      maximum-expected-value:
+        "[http.server.requests]": 10s
+  observations:
+    annotations:
+      # 保持 false，是因为 ObservedAspect 已在 TelemetryConfig 里显式声明；
+      # 若改成 true 且不删那个 bean，Boot 的自动配置会因为 @ConditionalOnMissingBean 直接退让，不会重复织入
+      enabled: false
+
+info:
+  app:
+    name: ${spring.application.name}
+    encoding: @project.build.sourceEncoding@
+    java:
+      version: @java.version@

@@ -1,0 +1,61 @@
+# =====================================================================================
+# Filebeat —— 旁路采集器（sidecar 模式的第一跳）
+#   读宿主机挂进来的 JSON 日志 → 按 ndjson 解析 → 原样投 Kafka
+#   刻意"只搬不算"：解析/富化/转储都留给 Logstash，Filebeat 保持轻，坏了也不影响业务
+# =====================================================================================
+
+name: ${FILEBEAT_NAME:obs-filebeat}
+
+filebeat.inputs:
+  - type: filestream            # 8.x 推荐；老 log input 已废弃
+    id: hello-observability-json
+    enabled: true
+    paths:
+      - /var/log/app/*.json
+    # 我们的日志是一行一个 JSON，直接按 ndjson 拆，拆出来的字段平铺到事件根
+    parsers:
+      - ndjson:
+          target: ""
+          overwrite_keys: true      # 应用字段优先于 filebeat 自带字段（例如 message）
+          add_error_key: true
+          expand_keys: false
+    # 滚动文件是 gzip 的（*.json.gz），filestream 不读 .gz，正好避免重复采集历史归档
+    prospector.scanner.check_interval: 3s
+    close.on_state_change.inactive: 5m
+    fields:
+      log_source: hello-observability
+    fields_under_root: false
+
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+  # 瘦身：filebeat 自己的元数据没必要进 Kafka（省带宽也省 ES 字段）
+  - drop_fields:
+      fields:
+        - "agent.ephemeral_id"
+        - "agent.version"
+        - "ecs.version"
+        - "input.type"
+        - "log.file.device_id"
+        - "log.file.inode"
+      ignore_missing: true
+
+queue.mem:
+  events: 4096
+  flush.min_events: 512
+  flush.timeout: 1s
+
+# ---- 第一跳：Kafka ----
+output.kafka:
+  hosts: ["kafka:9092"]              # 容器内网，NOT host.docker.internal
+  topic: "app-logs"
+  partition.round_robin:
+    reachable_only: false
+  required_acks: 1                   # 单副本 demo；生产至少 -1（all）
+  compression: gzip
+  max_message_bytes: 1000000
+  keep_alive: 60
+
+logging.level: info
+logging.to_files: false
+logging.to_stderr: true
